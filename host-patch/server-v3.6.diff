@@ -1,0 +1,115 @@
+--- /mnt/data/host_assets31/server.mjs	2026-11-01 19:54:54.544156524 +0000
++++ /mnt/data/MadreseyarTeacherAndroid-DirectAPI-v3.6.0-DAILY-WORKFLOW/host-patch/server.mjs	2026-11-01 19:56:50.052838134 +0000
+@@ -4335,6 +4335,73 @@
+       const body=await readJson(req),id=String(body.id||"");const saved=await mutateDb(m=>{let count=0;for(const n of m.notifications||[]){if(n.userId===auth.user.id&&(!id||n.id===id)){n.read=true;n.readAt=new Date().toISOString();count++;}}return count;});return sendJson(res,200,{ok:true,count:saved.result});
+     }
+ 
++
++    // v3.6 Android Daily Workflow — scoped native endpoints for the teacher app.
++    if (req.method === "GET" && url.pathname === "/api/staff/mobile/students") {
++      const scoped=scopedDbForStaff(auth.db,auth.user), requestedClass=String(url.searchParams.get("classId")||"").trim();
++      const allowedClasses=new Set(activeTeachingAssignments(auth.db,auth.user,"students").map(a=>String(a.classId||"")));
++      const rows=(scoped.users||[]).filter(u=>u.role==="student"&&u.active!==false&&u.profileStatus!=="deleted"&&allowedClasses.has(String(u.classId||""))&&(!requestedClass||String(u.classId)===requestedClass));
++      const students=await Promise.all(rows.map(async st=>{
++        const dossier=buildStudentDossierV4521(scoped,st.id,{includeSensitive:false})||{};
++        const photoDataUrl=await readStudentProfilePhoto(st.id);
++        return {id:st.id,firstName:st.firstName||"",lastName:st.lastName||"",studentCode:st.studentCode||"",classId:st.classId||"",className:(scoped.school?.classes||[]).find(c=>c.id===st.classId)?.name||"",photoDataUrl,
++          attendance:dossier.attendance||{},discipline:dossier.discipline||{},analysis:{overallAveragePercent:dossier.analysis?.overallAveragePercent??null,status:dossier.analysis?.status||{},trend:dossier.analysis?.trend||{},homework:dossier.analysis?.homework||{}},
++          guardianMobile:st.guardianMobile||"",studentMobile:st.studentMobile||""};
++      }));
++      return sendJson(res,200,{ok:true,students});
++    }
++    if (req.method === "GET" && url.pathname === "/api/staff/mobile/gradebook") {
++      const classId=String(url.searchParams.get("classId")||""),subject=String(url.searchParams.get("subject")||"").trim(),academicPeriod=normalizeAcademicPeriod(url.searchParams.get("academicPeriod")||"semester2",{allowAnnual:false}),academicYear=String(auth.db.school?.year||"");
++      if(!classId||!subject)throw Object.assign(new Error("کلاس و درس الزامی است."),{status:400});
++      if(auth.user.role==="teacher"&&!teacherCanAssigned(auth.db,auth.user,{classId,subject,feature:"continuous"}))throw Object.assign(new Error("به دفتر نمره این کلاس دسترسی ندارید."),{status:403});
++      const payload=gradebookPayloadV75(auth.db,{classId,subject,academicYear,academicPeriod}),continuousMax=Number(payload.config?.outputMaxScore||0),finalMax=Math.round((20-continuousMax)*100)/100;
++      const students=(payload.students||[]).map(st=>{
++        const approved=(auth.db.continuousGradeOverrides||[]).filter(r=>r.active!==false&&r.studentId===st.id&&r.classId===classId&&r.subject===subject&&String(r.academicYear||academicYear)===academicYear&&String(r.academicPeriod||r.period||"semester2")===academicPeriod).sort((a,b)=>String(b.updatedAt||"").localeCompare(String(a.updatedAt||"")))[0]||null;
++        const final=(auth.db.termFinalOverrides||[]).filter(r=>r.active!==false&&r.studentId===st.id&&r.classId===classId&&r.subject===subject&&String(r.academicYear||academicYear)===academicYear&&String(r.academicPeriod||"semester2")===academicPeriod).sort((a,b)=>String(b.updatedAt||"").localeCompare(String(a.updatedAt||"")))[0]||null;
++        const calculated20=st.result?.score==null?null:Number(st.result.score),continuousRaw=approved?Number(approved.approvedRawScore||0):(calculated20==null?null:Math.round(calculated20/20*continuousMax*100)/100),finalRaw=final?Number(final.score||0):null;
++        const total=continuousRaw==null&&finalRaw==null?null:Math.round((Number(continuousRaw||0)+Number(finalRaw||0))*100)/100;
++        return {...st,continuousCalculated20:calculated20,continuousApproved:approved?{score:Number(approved.approvedRawScore||0),maxScore:Number(approved.approvedMaxScore||continuousMax)}:null,continuousRaw,finalMark:final?{score:Number(final.score||0),maxScore:Number(final.maxScore||finalMax)}:null,termTotal:total};
++      });
++      return sendJson(res,200,{ok:true,config:payload.config,entries:payload.entries,lock:payload.lock,shares:{continuousMax,finalMax},students});
++    }
++    if (req.method === "GET" && url.pathname === "/api/staff/mobile/class-journal") {
++      const classId=String(url.searchParams.get("classId")||"").trim(),subject=String(url.searchParams.get("subject")||"").trim(),academicPeriod=normalizeAcademicPeriod(url.searchParams.get("academicPeriod")||"semester2",{allowAnnual:false}),year=String(auth.db.school?.year||"");
++      if(classId&&auth.user.role==="teacher"&&!teacherCanAssigned(auth.db,auth.user,{classId,subject,feature:"classJournal"}))throw Object.assign(new Error("به دفتر کلاسی این درس دسترسی ندارید."),{status:403});
++      const rows=(auth.db.lessonLogs||[]).filter(r=>String(r.academicYear||year)===year&&String(r.academicPeriod||r.period||"semester2")===academicPeriod&&(!classId||String(r.classId)===classId)&&(!subject||String(r.subject||"")===subject)&&(auth.user.role!=="teacher"||String(r.teacherId||r.createdBy||"")===String(auth.user.id))).slice().sort((a,b)=>String(b.date||b.createdAtIso||b.createdAt||"").localeCompare(String(a.date||a.createdAtIso||a.createdAt||"")));
++      return sendJson(res,200,{ok:true,logs:rows});
++    }
++    if (req.method === "POST" && url.pathname === "/api/staff/mobile/class-journal") {
++      const body=await readJson(req),classId=String(body.classId||"").trim(),subject=String(body.subject||"").trim(),academicPeriod=normalizeAcademicPeriod(body.academicPeriod||"semester2",{allowAnnual:false}),year=String(auth.db.school?.year||"");
++      if(!classId||!subject)throw Object.assign(new Error("کلاس و درس الزامی است."),{status:400});
++      if(auth.user.role==="teacher"&&!teacherCanAssigned(auth.db,auth.user,{classId,subject,feature:"classJournal"}))throw Object.assign(new Error("به دفتر کلاسی این درس دسترسی ندارید."),{status:403});
++      const date=String(body.date||new Date().toISOString().slice(0,10)).slice(0,10),status=["planned","taught","cancelled"].includes(String(body.status))?String(body.status):"taught",title=String(body.title||"").trim().slice(0,180),content=String(body.content||"").trim().slice(0,5000),homework=String(body.homework||"").trim().slice(0,2500),privateNote=String(body.privateNote||"").trim().slice(0,2500);
++      if(!title&&!content)throw Object.assign(new Error("عنوان یا محتوای جلسه را وارد کنید."),{status:400});
++      const saved=await mutateDb(m=>{m.lessonLogs=Array.isArray(m.lessonLogs)?m.lessonLogs:[];const id=String(body.id||"").trim();let row=id?m.lessonLogs.find(x=>String(x.id)===id&&String(x.teacherId||x.createdBy||"")===String(auth.user.id)):null;const now=new Date().toISOString(),payload={classId,subject,academicYear:year,academicPeriod,date,periodNo:Number(body.periodNo||0),chapterId:String(body.chapterId||"").slice(0,120),chapterTitle:String(body.chapterTitle||"").slice(0,180),title,content,homework,privateNote,status,teacherId:auth.user.id,updatedAtIso:now,updatedAt:faNow(),updatedBy:auth.user.id};if(row)Object.assign(row,payload);else{row={id:makeId("lesson"),...payload,createdAtIso:now,createdAt:faNow(),createdBy:auth.user.id};m.lessonLogs.unshift(row);}m.audit=Array.isArray(m.audit)?m.audit:[];m.audit.unshift({id:makeId("log"),userId:auth.user.id,action:"ثبت دفتر کلاسی موبایل",details:`${classId} · ${subject} · ${date} · ${title}`,at:faNow()});return row;});
++      return sendJson(res,200,{ok:true,log:saved.result});
++    }
++    if (req.method === "GET" && url.pathname === "/api/staff/mobile/homework-center") {
++      const scoped=scopedDbForStaff(auth.db,auth.user),classId=String(url.searchParams.get("classId")||"").trim();
++      const homework=(scoped.homework||[]).filter(h=>h.status!=="archived"&&(!classId||String(h.classId)===classId)&&teacherCanAssigned(auth.db,auth.user,{classId:h.classId||"",subject:h.subject||"",feature:"homework"})).slice().sort((a,b)=>String(b.updatedAtIso||b.createdAtIso||b.createdAt||"").localeCompare(String(a.updatedAtIso||a.createdAtIso||a.createdAt||""))).map(h=>{
++        const eligible=(scoped.users||[]).filter(s=>s.role==="student"&&String(s.classId)===String(h.classId)&&s.active!==false&&s.profileStatus!=="deleted"&&(String(h.recipientMode||"all")!=="selected"||(h.studentIds||[]).map(String).includes(String(s.id))));
++        const submissions=(scoped.homeworkSubmissions||[]).filter(x=>String(x.homeworkId)===String(h.id)).map(x=>{const st=(scoped.users||[]).find(s=>String(s.id)===String(x.studentId));return {...x,studentName:st?`${st.firstName||""} ${st.lastName||""}`.trim():"دانش‌آموز",studentCode:st?.studentCode||""};});
++        return {...h,className:(scoped.school?.classes||[]).find(c=>c.id===h.classId)?.name||"",assignedCount:eligible.length,submittedCount:submissions.length,gradedCount:submissions.filter(x=>x.status==="graded").length,submissions};
++      });
++      return sendJson(res,200,{ok:true,homework});
++    }
++    if (req.method === "GET" && url.pathname === "/api/staff/mobile/grading-queue") {
++      const scoped=scopedDbForStaff(auth.db,auth.user),examId=String(url.searchParams.get("examId")||"").trim();
++      const exams=(scoped.exams||[]).filter(e=>["descriptive","mixed"].includes(String(e.type||""))&&(!examId||String(e.id)===examId)&&teacherCanAssigned(auth.db,auth.user,{classId:e.classId||"",subject:e.subject||"",bookId:e.bookId||"",feature:"grading"}));
++      const ids=new Set(exams.map(e=>String(e.id))),queue=(scoped.submissions||[]).filter(s=>ids.has(String(s.examId))).map(s=>{const e=exams.find(x=>String(x.id)===String(s.examId)),st=(scoped.users||[]).find(x=>String(x.id)===String(s.studentId)),grade=(scoped.grades||[]).find(g=>String(g.submissionId)===String(s.id)||String(g.uploadId)===String(s.id));return {submissionId:s.id,examId:s.examId,examTitle:e?.title||"آزمون",subject:e?.subject||"",studentId:s.studentId,studentName:st?`${st.firstName||""} ${st.lastName||""}`.trim():"دانش‌آموز",studentCode:st?.studentCode||"",submittedAt:s.submittedAt||s.at||"",status:grade?"final":"pending",finalScore:grade?.finalScore??null,totalScore:examTotalScore(e||{})};});
++      return sendJson(res,200,{ok:true,queue});
++    }
++    if (req.method === "GET" && url.pathname === "/api/staff/mobile/grading-detail") {
++      const submissionId=String(url.searchParams.get("submissionId")||"").trim(),sub=(auth.db.submissions||[]).find(x=>String(x.id)===submissionId),exam=(auth.db.exams||[]).find(x=>String(x.id)===String(sub?.examId));
++      if(!sub||!exam||!canTeacherGradeP6722(auth.db,auth.user,exam,sub))throw Object.assign(new Error("برگه در دسترس نیست."),{status:404});
++      const student=(auth.db.users||[]).find(x=>String(x.id)===String(sub.studentId)),grade=(auth.db.grades||[]).find(g=>String(g.submissionId)===submissionId||String(g.uploadId)===submissionId)||null,auto=new Map((sub.autoGrading?.questions||[]).map(q=>[String(q.questionId),q]));
++      const questions=(exam.questions||[]).map((q,index)=>{const a=auto.get(String(q.id))||{},typed=String(sub.typedAnswers?.[q.id]||"");return {id:String(q.id),number:index+1,type:String(q.type||"descriptive"),text:String(q.text||""),score:Number(q.score||0),choices:Array.isArray(q.choices)?q.choices:[],referenceAnswer:String(q.referenceAnswer||q.answerText||""),rubric:Array.isArray(q.rubric)?q.rubric:[],studentAnswer:typed||String(a.studentAnswer??""),autoGraded:Boolean(a.autoGraded),autoScore:a.earnedScore??null,correctAnswer:a.correctAnswer??null};});
++      return sendJson(res,200,{ok:true,submission:{id:sub.id,examId:sub.examId,studentId:sub.studentId,submittedAt:sub.submittedAt||sub.at||"",files:Array.isArray(sub.files)?sub.files:[],status:sub.status||""},student:{id:student?.id||sub.studentId,firstName:student?.firstName||"",lastName:student?.lastName||"",studentCode:student?.studentCode||""},exam:{id:exam.id,title:exam.title||"آزمون",subject:exam.subject||"",type:exam.type||"",totalScore:examTotalScore(exam)},questions,grade});
++    }
++
+     return sendJson(res, 404, { error: "مسیر امنیت کارکنان پیدا نشد." });
+   } catch (error) {
+     return sendJson(res, error.status || 500, { error: error.message || "خطای احراز هویت", code: error.code || undefined });
+@@ -4627,6 +4694,10 @@
+       const win=teacherWindowV78(entry,clock);if(!win.open)throw Object.assign(new Error("الان خارج از بازه ثبت حضور این کلاس هستید."),{status:409});
+       const block=classAttendanceBlockV78(db,entry.classId,clock.date);if(block)throw Object.assign(new Error(`ثبت حضور امروز به علت «${block.title||"تعطیلی"}» بسته است.`),{status:409});
+       const roster=activeClassStudentsV78(db,entry.classId),rosterIds=new Set(roster.map(s=>s.id)),presentIds=new Set((Array.isArray(body.presentStudentIds)?body.presentStudentIds:[]).map(String).filter(id=>rosterIds.has(id)));
++      const rawStudentStatuses=(body.studentStatuses&&typeof body.studentStatuses==="object"&&!Array.isArray(body.studentStatuses))?body.studentStatuses:null;
++      const allowedTeacherStatuses=new Set(["present","absent_excused","absent_unexcused"]);
++      const requestedStatuses=new Map();
++      if(rawStudentStatuses){for(const [studentId,rawStatus] of Object.entries(rawStudentStatuses)){if(!rosterIds.has(String(studentId)))continue;const status=String(rawStatus||"").trim();if(!allowedTeacherStatuses.has(status))throw Object.assign(new Error("وضعیت حضور انتخاب‌شده معتبر نیست."),{status:400});requestedStatuses.set(String(studentId),status);}}
+       const saved=await mutateDb(m=>{
+         m.attendanceSessions=Array.isArray(m.attendanceSessions)?m.attendanceSessions:[];m.attendance=Array.isArray(m.attendance)?m.attendance:[];m.audit=Array.isArray(m.audit)?m.audit:[];
+         let session=m.attendanceSessions.find(x=>x.scheduleEntryId===entry.id&&x.date===clock.date&&x.teacherId===auth.user.id);
+@@ -4638,13 +4709,22 @@
+         m.attendance=m.attendance.filter(x=>x.sessionId!==session.id||classIds.has(x.studentId));
+         for(const stu of classStudents){
+           const row=existing.get(stu.id);const was=normalizeAttendanceStatusV81(row?.status);const checked=presentIds.has(stu.id);
+-          const status=checked?"present":["absent_excused","absent_unexcused"].includes(was)?was:"absent_pending";
+-          const base={sessionId:session.id,scheduleEntryId:entry.id,studentId:stu.id,classId:entry.classId,subject:entry.subject||"",teacherId:auth.user.id,date:clock.date,periodNo:Number(entry.periodNo||0),shiftId:entry.shiftId||"",academicYear:String(m.school?.year||""),academicPeriod:period,status,markedBy:auth.user.id,markedAt:row?.markedAt||now,updatedAt:now,source:"teacher-app-v81"};
+-          if(row){Object.assign(row,base);if(checked){row.absenceReasonId="";row.absenceReasonText="";row.reviewedAt="";row.reviewedBy="";row.reviewNote="";}}
+-          else m.attendance.push({id:makeId("att"),...base,reviewHistory:[]});
++          const requested=requestedStatuses.get(String(stu.id));
++          const status=requested||(checked?"present":["absent_excused","absent_unexcused"].includes(was)?was:"absent_pending");
++          const base={sessionId:session.id,scheduleEntryId:entry.id,studentId:stu.id,classId:entry.classId,subject:entry.subject||"",teacherId:auth.user.id,date:clock.date,periodNo:Number(entry.periodNo||0),shiftId:entry.shiftId||"",academicYear:String(m.school?.year||""),academicPeriod:period,status,markedBy:auth.user.id,markedAt:row?.markedAt||now,updatedAt:now,source:"teacher-app-v350"};
++          if(row)Object.assign(row,base);else{m.attendance.push({id:makeId("att"),...base,reviewHistory:[]});}
++          const target=row||m.attendance[m.attendance.length-1];
++          if(status==="present"){
++            target.absenceReasonId="";target.absenceReasonText="";target.reviewedAt="";target.reviewedBy="";target.reviewNote="";
++          }else if(status==="absent_excused"||status==="absent_unexcused"){
++            const from=was||"absent_pending",reasonText=status==="absent_excused"?"غیبت موجه - ثبت توسط معلم":"غیبت غیرموجه - ثبت توسط معلم";
++            target.reviewHistory=Array.isArray(target.reviewHistory)?target.reviewHistory:[];
++            if(from!==status)target.reviewHistory.push({from,to:status,reasonId:"",reasonText,note:"ثبت مستقیم توسط معلم از اپ",by:auth.user.id,at:now});
++            target.absenceReasonId="";target.absenceReasonText=reasonText;target.reviewedAt=now;target.reviewedBy=auth.user.id;target.reviewNote="ثبت مستقیم توسط معلم از اپ";
++          }
+         }
+         const latest=m.attendance.filter(x=>x.sessionId===session.id&&classIds.has(x.studentId)),present=latest.filter(x=>normalizeAttendanceStatusV81(x.status)==="present").length,pending=latest.filter(x=>normalizeAttendanceStatusV81(x.status)==="absent_pending").length,excused=latest.filter(x=>normalizeAttendanceStatusV81(x.status)==="absent_excused").length,unexcused=latest.filter(x=>normalizeAttendanceStatusV81(x.status)==="absent_unexcused").length,absent=pending+excused+unexcused;
+-        m.audit.unshift({id:makeId("log"),userId:auth.user.id,action:"ثبت حضور از اپ معلم",details:`${entry.subject||"کلاس"} · ${classInfoV78(m,entry.classId).name} · حاضر ${present} · غایب ${absent} (در انتظار بررسی ${pending})`,at:faNow()});
++        m.audit.unshift({id:makeId("log"),userId:auth.user.id,action:"ثبت حضور از اپ معلم",details:`${entry.subject||"کلاس"} · ${classInfoV78(m,entry.classId).name} · حاضر ${present} · موجه ${excused} · غیرموجه ${unexcused} · در انتظار ${pending}`,at:faNow()});
+         return {sessionId:session.id,present,absent,pending,excused,unexcused,total:classStudents.length,absentStudentIds:classStudents.filter(st=>!presentIds.has(st.id)).map(st=>st.id)};
+       });
+       await securityAudit({type:"teacher_attendance_submit",userId:auth.user.id,role:"teacher",success:true,ip:clientIp(req),details:`${entry.id}:${clock.date}:${saved.result.present}/${saved.result.total}`});

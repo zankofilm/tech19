@@ -1,0 +1,41 @@
+--- /mnt/data/host_check/server.mjs	2026-10-31 15:14:00.000000000 +0000
++++ /mnt/data/host_attendance_patch/server.mjs	2026-11-01 19:26:30.786580679 +0000
+@@ -4627,6 +4627,10 @@
+       const win=teacherWindowV78(entry,clock);if(!win.open)throw Object.assign(new Error("الان خارج از بازه ثبت حضور این کلاس هستید."),{status:409});
+       const block=classAttendanceBlockV78(db,entry.classId,clock.date);if(block)throw Object.assign(new Error(`ثبت حضور امروز به علت «${block.title||"تعطیلی"}» بسته است.`),{status:409});
+       const roster=activeClassStudentsV78(db,entry.classId),rosterIds=new Set(roster.map(s=>s.id)),presentIds=new Set((Array.isArray(body.presentStudentIds)?body.presentStudentIds:[]).map(String).filter(id=>rosterIds.has(id)));
++      const rawStudentStatuses=(body.studentStatuses&&typeof body.studentStatuses==="object"&&!Array.isArray(body.studentStatuses))?body.studentStatuses:null;
++      const allowedTeacherStatuses=new Set(["present","absent_excused","absent_unexcused"]);
++      const requestedStatuses=new Map();
++      if(rawStudentStatuses){for(const [studentId,rawStatus] of Object.entries(rawStudentStatuses)){if(!rosterIds.has(String(studentId)))continue;const status=String(rawStatus||"").trim();if(!allowedTeacherStatuses.has(status))throw Object.assign(new Error("وضعیت حضور انتخاب‌شده معتبر نیست."),{status:400});requestedStatuses.set(String(studentId),status);}}
+       const saved=await mutateDb(m=>{
+         m.attendanceSessions=Array.isArray(m.attendanceSessions)?m.attendanceSessions:[];m.attendance=Array.isArray(m.attendance)?m.attendance:[];m.audit=Array.isArray(m.audit)?m.audit:[];
+         let session=m.attendanceSessions.find(x=>x.scheduleEntryId===entry.id&&x.date===clock.date&&x.teacherId===auth.user.id);
+@@ -4638,13 +4642,22 @@
+         m.attendance=m.attendance.filter(x=>x.sessionId!==session.id||classIds.has(x.studentId));
+         for(const stu of classStudents){
+           const row=existing.get(stu.id);const was=normalizeAttendanceStatusV81(row?.status);const checked=presentIds.has(stu.id);
+-          const status=checked?"present":["absent_excused","absent_unexcused"].includes(was)?was:"absent_pending";
+-          const base={sessionId:session.id,scheduleEntryId:entry.id,studentId:stu.id,classId:entry.classId,subject:entry.subject||"",teacherId:auth.user.id,date:clock.date,periodNo:Number(entry.periodNo||0),shiftId:entry.shiftId||"",academicYear:String(m.school?.year||""),academicPeriod:period,status,markedBy:auth.user.id,markedAt:row?.markedAt||now,updatedAt:now,source:"teacher-app-v81"};
+-          if(row){Object.assign(row,base);if(checked){row.absenceReasonId="";row.absenceReasonText="";row.reviewedAt="";row.reviewedBy="";row.reviewNote="";}}
+-          else m.attendance.push({id:makeId("att"),...base,reviewHistory:[]});
++          const requested=requestedStatuses.get(String(stu.id));
++          const status=requested||(checked?"present":["absent_excused","absent_unexcused"].includes(was)?was:"absent_pending");
++          const base={sessionId:session.id,scheduleEntryId:entry.id,studentId:stu.id,classId:entry.classId,subject:entry.subject||"",teacherId:auth.user.id,date:clock.date,periodNo:Number(entry.periodNo||0),shiftId:entry.shiftId||"",academicYear:String(m.school?.year||""),academicPeriod:period,status,markedBy:auth.user.id,markedAt:row?.markedAt||now,updatedAt:now,source:"teacher-app-v350"};
++          if(row)Object.assign(row,base);else{m.attendance.push({id:makeId("att"),...base,reviewHistory:[]});}
++          const target=row||m.attendance[m.attendance.length-1];
++          if(status==="present"){
++            target.absenceReasonId="";target.absenceReasonText="";target.reviewedAt="";target.reviewedBy="";target.reviewNote="";
++          }else if(status==="absent_excused"||status==="absent_unexcused"){
++            const from=was||"absent_pending",reasonText=status==="absent_excused"?"غیبت موجه - ثبت توسط معلم":"غیبت غیرموجه - ثبت توسط معلم";
++            target.reviewHistory=Array.isArray(target.reviewHistory)?target.reviewHistory:[];
++            if(from!==status)target.reviewHistory.push({from,to:status,reasonId:"",reasonText,note:"ثبت مستقیم توسط معلم از اپ",by:auth.user.id,at:now});
++            target.absenceReasonId="";target.absenceReasonText=reasonText;target.reviewedAt=now;target.reviewedBy=auth.user.id;target.reviewNote="ثبت مستقیم توسط معلم از اپ";
++          }
+         }
+         const latest=m.attendance.filter(x=>x.sessionId===session.id&&classIds.has(x.studentId)),present=latest.filter(x=>normalizeAttendanceStatusV81(x.status)==="present").length,pending=latest.filter(x=>normalizeAttendanceStatusV81(x.status)==="absent_pending").length,excused=latest.filter(x=>normalizeAttendanceStatusV81(x.status)==="absent_excused").length,unexcused=latest.filter(x=>normalizeAttendanceStatusV81(x.status)==="absent_unexcused").length,absent=pending+excused+unexcused;
+-        m.audit.unshift({id:makeId("log"),userId:auth.user.id,action:"ثبت حضور از اپ معلم",details:`${entry.subject||"کلاس"} · ${classInfoV78(m,entry.classId).name} · حاضر ${present} · غایب ${absent} (در انتظار بررسی ${pending})`,at:faNow()});
++        m.audit.unshift({id:makeId("log"),userId:auth.user.id,action:"ثبت حضور از اپ معلم",details:`${entry.subject||"کلاس"} · ${classInfoV78(m,entry.classId).name} · حاضر ${present} · موجه ${excused} · غیرموجه ${unexcused} · در انتظار ${pending}`,at:faNow()});
+         return {sessionId:session.id,present,absent,pending,excused,unexcused,total:classStudents.length,absentStudentIds:classStudents.filter(st=>!presentIds.has(st.id)).map(st=>st.id)};
+       });
+       await securityAudit({type:"teacher_attendance_submit",userId:auth.user.id,role:"teacher",success:true,ip:clientIp(req),details:`${entry.id}:${clock.date}:${saved.result.present}/${saved.result.total}`});
